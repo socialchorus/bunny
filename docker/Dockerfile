@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.10
 
 RUN apt-get update -y
 RUN apt-get install -y gnupg2 curl locales
