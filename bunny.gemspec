@@ -10,7 +10,7 @@ Gem::Specification.new do |s|
   s.summary = "Popular easy to use Ruby client for RabbitMQ"
   s.description = "Easy to use, feature complete Ruby client for RabbitMQ 3.9 and later versions."
   s.license = "MIT"
-  s.required_ruby_version = Gem::Requirement.new(">= 2.5")
+  s.required_ruby_version = Gem::Requirement.new(">= 3.0")
 
   s.metadata = {
     "changelog_uri" => "https://github.com/ruby-amqp/bunny/blob/main/ChangeLog.md",
@@ -28,9 +28,10 @@ Gem::Specification.new do |s|
   s.email = ["michael.s.klishin@gmail.com"]
 
   # Dependencies
-  s.add_runtime_dependency 'amq-protocol', '~> 2.3'
-  s.add_runtime_dependency 'sorted_set', '~> 1', '>= 1.0.2'
+  s.add_runtime_dependency 'amq-protocol', '~> 2.7'
+  s.add_runtime_dependency 'logger', '~> 1', '>= 1.7'
   s.add_runtime_dependency 'resolv-replace', '~> 0.1.1'
+  s.add_runtime_dependency 'sorted_set', '~> 1', '>= 1.0.2'
 
   # Files.
   s.extra_rdoc_files = ["README.md"]

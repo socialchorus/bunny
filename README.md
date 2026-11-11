@@ -43,11 +43,19 @@ Specific examples:
    Web applications that display that information in the real time.
 
 
+## Ports to Other Languages
+
+Bunny has inspired a number of other RabbitMQ (AMQP 0-9-1) client libraries
+that closely follow its feature set and API shape, form and ergonomics.
+
+ * [Swift 6](https://github.com/michaelklishin/bunny-swift)
+
+
 ## Supported Ruby Versions
 
 Modern Bunny versions support
 
- * CRuby 3.2 through 3.4 (inclusive)
+ * CRuby 3.2 through 4.0 (inclusive)
  * [TruffleRuby](https://www.graalvm.org/ruby/)
 
 For environments that use TLS, Bunny expects Ruby installations to use a recent enough OpenSSL version that
@@ -57,7 +65,7 @@ For environments that use TLS, Bunny expects Ruby installations to use a recent 
 
 Bunny no longer supports JRuby.
 
-JRuby users should use [March Hare](http://rubymarchhare.info), which has a similar API
+JRuby users should use [March Hare](https://github.com/ruby-amqp/march_hare), which has a similar API
 and is built on top of the RabbitMQ Java client specifically for JRuby.
 
 
@@ -87,7 +95,7 @@ may introduce, e.g. the idempotency of `queue.delete` operations.
 To use Bunny in a project managed with Bundler:
 
 ``` ruby
-gem "bunny", ">= 2.23.0"
+gem "bunny", ">= 3.0"
 ```
 
 ### With Rubygems
@@ -115,7 +123,9 @@ conn.start
 
 # open a channel
 ch = conn.create_channel
-ch.confirm_select
+# enable publisher confirms with automatic tracking,
+# see https://www.rabbitmq.com/docs/publishers#data-safety
+ch.confirm_select(tracking: true)
 
 # declare a queue
 q  = ch.queue("test1")
@@ -127,10 +137,6 @@ end
 
 # publish a message to the default exchange which then gets routed to this queue
 q.publish("Hello, everybody!")
-
-# await confirmations from RabbitMQ, see
-# https://www.rabbitmq.com/publishers.html#data-safety for details
-ch.wait_for_confirms
 
 # give the above consumer some time consume the delivery and print out the message
 sleep 1
@@ -212,7 +218,7 @@ and steps to reproduce (or failing test cases).
 ## Other Ruby RabbitMQ Clients
 
 The other widely used Ruby RabbitMQ client is [March Hare](http://rubymarchhare.info) (JRuby-only).
-It's a mature library that require RabbitMQ 3.3.x or later.
+It's a mature library that requires RabbitMQ 3.3.x or later.
 
 
 ## Contributing

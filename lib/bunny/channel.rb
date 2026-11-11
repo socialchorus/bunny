@@ -153,6 +153,12 @@ module Bunny
     attr_reader :unconfirmed_set
     # @return [Set<Integer>] Set of nacked message indexes that have been nacked
     attr_reader :nacked_set
+    # @return [Boolean] true if publisher confirm tracking is enabled
+    attr_reader :confirms_tracking_enabled
+    # @return [Integer, nil] Maximum outstanding unconfirmed messages before throttling
+    attr_reader :outstanding_limit
+    # @return [Integer, nil] Timeout in milliseconds for waiting on publisher confirms
+    attr_reader :confirm_timeout
     # @return [Hash<String, Bunny::Consumer>] Consumer instances declared on this channel
     attr_reader :consumers
 
@@ -164,12 +170,19 @@ module Bunny
     attr_reader :cancel_consumers_before_closing
 
     DEFAULT_CONTENT_TYPE = "application/octet-stream".freeze
+
+    # Default outstanding limit for publisher confirms with tracking.
+    # Batch size of 1000 provides optimal throughput per benchmarks.
+    DEFAULT_OUTSTANDING_CONFIRMS_LIMIT = 1000
     SHORTSTR_LIMIT = 255
 
     # @param [Bunny::Session] connection AMQP 0.9.1 connection
     # @param [Integer] id Channel id, pass nil to make Bunny automatically allocate it
-    # @param [Bunny::ConsumerWorkPool] work_pool Thread pool for delivery processing, by default of size 1
-    def initialize(connection = nil, id = nil, work_pool = ConsumerWorkPool.new(1))
+    # @param [HashMap] opts Additional options
+    # @option opts [Bunny::ConsumerWorkPool] work_pool Thread pool for delivery processing, by default of size 1
+    def initialize(connection = nil, id = nil, opts = {})
+      work_pool = opts.fetch(:work_pool, ConsumerWorkPool.new(1))
+
       @connection = connection
       @logger     = connection.logger
       @id         = id || @connection.next_channel_id
@@ -185,7 +198,6 @@ module Bunny
       end
 
       @status     = :opening
-
       @connection.register_channel(self)
 
       @queues     = Hash.new
@@ -202,6 +214,15 @@ module Bunny
 
       @unconfirmed_set_mutex = @connection.mutex_impl.new
 
+      # Publisher confirm tracking (initialized before reset_continuations)
+      @confirms_tracking_enabled = false
+      @outstanding_limit = nil
+      @confirm_timeout = nil
+      @throttle_publishes = false
+      @per_message_continuations = {}
+      @per_message_continuations_mutex = @connection.mutex_impl.new
+      @outstanding_limit_cond = nil
+
       self.reset_continuations
 
       # threads awaiting on continuations. Used to unblock
@@ -214,15 +235,15 @@ module Bunny
       @next_publish_seq_no = 0
       @delivery_tag_offset = 0
 
-      @recoveries_counter = Bunny::Concurrent::AtomicFixnum.new(0)
       @uncaught_exception_handler = Proc.new do |e, consumer|
         @logger.error "Uncaught exception from consumer #{consumer.to_s}: #{e.inspect} @ #{e.backtrace[0]}"
       end
 
       @cancel_consumers_before_closing = false
-    end
 
-    attr_reader :recoveries_counter
+      @last_consumer_tag = nil
+      @last_consumer = nil
+    end
 
     # @private
     def wait_on_continuations_timeout
@@ -240,6 +261,7 @@ module Bunny
       @connection.open_channel(self)
       # clear last channel error
       @last_channel_error = nil
+      @frame_max = @connection.frame_max
 
       @status = :open
 
@@ -276,6 +298,35 @@ module Bunny
       maybe_kill_consumer_work_pool!
     end
 
+    # Reopens a channel that was closed by the server (e.g. due to a consumer
+    # delivery acknowledgement timeout). The channel is reopened on the same
+    # connection, reusing its original channel id, and its prefetch, confirm,
+    # and transactional settings are recovered.
+    #
+    # This does NOT recover topology (queues, exchanges, bindings, consumers).
+    # Use {Bunny::Session#recover_channel_topology} for that.
+    #
+    # @return [Bunny::Channel] self
+    # @see Bunny::Session#recover_channel_topology
+    # @api public
+    def reopen
+      raise "Cannot reopen a channel that is not closed" unless closed?
+
+      existing = @connection.synchronised_find_channel(@id)
+      if existing && existing != self
+        raise "Channel id #{@id} has been reassigned to another channel"
+      end
+
+      @work_pool = ConsumerWorkPool.new(@work_pool.size, @work_pool.abort_on_exception)
+      @work_pool.start
+
+      open
+
+      recover_from_network_failure
+
+      self
+    end
+
     # @return [Boolean] true if this channel is open, false otherwise
     # @api public
     def open?
@@ -286,6 +337,21 @@ module Bunny
     # @api public
     def closed?
       @status == :closed
+    end
+
+    # @private
+    def connection_closed!
+      @status = :closed
+    end
+
+    # @private
+    def recovering!
+      @status = :recovering
+    end
+
+    # @private
+    def recovery_completed!
+      @status = :open
     end
 
     #
@@ -423,7 +489,7 @@ module Bunny
     # @param [String] name Exchange name
     # @param [Hash] opts Exchange parameters
     #
-    # @option opts [String,Symbol] :type (:direct) Exchange type, e.g. :fanout or "x-consistent-hash"
+    # @option opts [String,Symbol] :type (:direct) Exchange type, e.g. :fanout or "x-consistent-hash" or "x-modulus-hash"
     # @option opts [Boolean] :durable (false) Should the exchange be durable?
     # @option opts [Boolean] :auto_delete (false) Should the exchange be automatically deleted when no longer in use?
     # @option opts [Hash] :arguments ({}) Optional exchange arguments
@@ -459,6 +525,136 @@ module Bunny
 
       q = find_queue(name) || Bunny::Queue.new(self, name, opts)
 
+      record_queue(q)
+      register_queue(q)
+    end
+
+    # Declares a new client-named quorum queue.
+    #
+    # @param [String] name Queue name. Empty (server-generated) names are not supported by this method.
+    # @param  [Hash]  opts  Queue properties and other options. Durability, exclusivity, auto-deletion options will be ignored.
+    #
+    # @option opts [Hash] :arguments ({}) Optional arguments (x-arguments)
+    #
+    # @return [Bunny::Queue] Queue that was declared
+    # @see #durable_queue
+    # @see #queue
+    # @api public
+    def quorum_queue(name, opts = {})
+      throw ArgumentError.new("quorum queue name must not be nil") if name.nil?
+      throw ArgumentError.new("quorum queue name must not be empty (server-named QQs do not make sense)") if name.empty?
+
+      durable_queue(name, Bunny::Queue::Types::QUORUM, opts)
+    end
+
+    # Declares a new client-named stream (that Bunny can use as if it was a queue).
+    # Note that Bunny would still use AMQP 0-9-1 to perform operations on this "queue".
+    # To use stream-specific operations and to gain from stream protocol efficiency and partitioning,
+    # use a Ruby client for the RabbitMQ stream protocol.
+    #
+    # @param [String] name Stream name. Empty (server-generated) names are not supported by this method.
+    # @param  [Hash]  opts  Queue properties and other options. Durability, exclusivity, auto-deletion options will be ignored.
+    #
+    # @option opts [Hash] :arguments ({}) Optional arguments (x-arguments)
+    #
+    #
+    # @return [Bunny::Queue] Queue that was declared
+    # @see #durable_queue
+    # @see #queue
+    # @api public
+    def stream(name, opts = {})
+      throw ArgumentError.new("stream name must not be nil") if name.nil?
+      throw ArgumentError.new("stream name must not be empty (server-named QQs do not make sense)") if name.empty?
+
+      durable_queue(name, Bunny::Queue::Types::STREAM, opts)
+    end
+
+    # Declares a Tanzu RabbitMQ delayed queue (a durable, replicated queue type).
+    # This queue type must be durable, non-exclusive, and non-auto-delete.
+    #
+    # @param [String] name Queue name. Empty (server-generated) names are not supported by this method.
+    # @param [Hash]  opts  Queue properties
+    #
+    # @option opts [String] :delayed_retry_type ("all") Retry strategy: "all", "failed", or "returned"
+    # @option opts [Integer] :delayed_retry_min (nil) Minimum retry delay in milliseconds
+    # @option opts [Integer] :delayed_retry_max (nil) Maximum retry delay in milliseconds
+    # @option opts [Hash] :arguments ({}) Optional arguments (x-arguments)
+    #
+    # @return [Bunny::Queue] Queue that was declared
+    # @see #durable_queue
+    # @see #queue
+    # @api public
+    def delayed_queue(name, opts = {})
+      throw ArgumentError.new("delayed queue name must not be nil") if name.nil?
+      throw ArgumentError.new("delayed queue name must not be empty") if name.empty?
+
+      args = opts[:arguments] || {}
+      args[Bunny::Queue::XArgs::DELAYED_RETRY_TYPE] = opts[:delayed_retry_type] if opts[:delayed_retry_type]
+      args[Bunny::Queue::XArgs::DELAYED_RETRY_MIN]  = opts[:delayed_retry_min]  if opts[:delayed_retry_min]
+      args[Bunny::Queue::XArgs::DELAYED_RETRY_MAX]  = opts[:delayed_retry_max]  if opts[:delayed_retry_max]
+
+      final_opts = opts.merge(:arguments => args)
+      final_opts.delete(:delayed_retry_type)
+      final_opts.delete(:delayed_retry_min)
+      final_opts.delete(:delayed_retry_max)
+
+      durable_queue(name, Bunny::Queue::Types::DELAYED, final_opts)
+    end
+
+    # Declares a Tanzu RabbitMQ JMS queue (a durable, replicated queue type).
+    # This queue type must be durable, non-exclusive, and non-auto-delete.
+    #
+    # @param [String] name Queue name. Empty (server-generated) names are not supported by this method.
+    # @param [Hash]  opts  Queue properties
+    #
+    # @option opts [Array<String>] :selector_fields (nil) Fields available for JMS selector expressions (e.g. ["priority", "region"], or ["*"] for all)
+    # @option opts [Integer] :selector_field_max_bytes (nil) Maximum byte size per selector field
+    # @option opts [Hash] :arguments ({}) Optional arguments (x-arguments)
+    #
+    # @return [Bunny::Queue] Queue that was declared
+    # @see #durable_queue
+    # @see #queue
+    # @api public
+    def jms_queue(name, opts = {})
+      throw ArgumentError.new("JMS queue name must not be nil") if name.nil?
+      throw ArgumentError.new("JMS queue name must not be empty") if name.empty?
+
+      args = opts[:arguments] || {}
+      args[Bunny::Queue::XArgs::SELECTOR_FIELDS]          = opts[:selector_fields]          if opts[:selector_fields]
+      args[Bunny::Queue::XArgs::SELECTOR_FIELD_MAX_BYTES] = opts[:selector_field_max_bytes] if opts[:selector_field_max_bytes]
+
+      final_opts = opts.merge(:arguments => args)
+      final_opts.delete(:selector_fields)
+      final_opts.delete(:selector_field_max_bytes)
+
+      durable_queue(name, Bunny::Queue::Types::JMS, final_opts)
+    end
+
+    # Declares a new server-named queue that is automatically deleted when the
+    # connection is closed.
+    #
+    # @param [String] name Queue name. Empty (server-generated) names are not supported by this method.
+    # @param  [Hash]  opts  Queue properties and other options. Durability, exclusivity, auto-deletion options will be ignored.
+    #
+    # @option opts [Hash] :arguments ({}) Optional arguments (x-arguments)
+    #
+    # @return [Bunny::Queue] Queue that was declared
+    # @see #queue
+    # @api public
+    def durable_queue(name, type = "classic", opts = {})
+      throw ArgumentError.new("queue name must not be nil") if name.nil?
+      throw ArgumentError.new("queue name must not be empty (server-named durable queues do not make sense)") if name.empty?
+
+      final_opts = opts.merge({
+        :type        => type,
+        :durable     => true,
+        # exclusive or auto-delete QQs do not make much sense
+        :exclusive   => false,
+        :auto_delete => false
+      })
+      q = find_queue(name) || Bunny::Queue.new(self, name, final_opts)
+
+      record_queue(q)
       register_queue(q)
     end
 
@@ -660,10 +856,25 @@ module Bunny
       opts[:content_type]  ||= DEFAULT_CONTENT_TYPE
       opts[:priority]      ||= 0
 
+      seq_no = nil
+      continuation = nil
+
       if @next_publish_seq_no > 0
         @unconfirmed_set_mutex.synchronize do
-          @unconfirmed_set.add(@next_publish_seq_no)
+          # With outstanding_limit: wait for slot if at the limit
+          wait_for_outstanding_slot_locked if @throttle_publishes
+
+          seq_no = @next_publish_seq_no
+          @unconfirmed_set.add(seq_no)
           @next_publish_seq_no += 1
+
+          # Only create per-message continuation when blocking individually (no limit)
+          if @confirms_tracking_enabled && !@throttle_publishes
+            continuation = new_continuation
+            @per_message_continuations_mutex.synchronize do
+              @per_message_continuations[seq_no] = continuation
+            end
+          end
         end
       end
 
@@ -674,8 +885,89 @@ module Bunny
         routing_key,
         opts[:mandatory],
         false,
-        @connection.frame_max)
+        @frame_max)
       @connection.send_frameset(frames, self)
+
+      wait_for_publish_confirm(seq_no, continuation) if continuation
+
+      self
+    end
+
+    # Publishes multiple messages in a batch with a single mutex acquisition.
+    # More efficient than calling basic_publish repeatedly when using publisher
+    # confirms with tracking. Recommended batch sizes: 500-3000.
+    #
+    # @param [Array<String>] payloads Array of message payloads to publish
+    # @param [String, Bunny::Exchange] exchange Exchange name or object
+    # @param [String] routing_key Routing key
+    # @param [Hash] opts Publishing options (applied to all messages)
+    # @return [self]
+    #
+    # @example Batch publishing with confirms
+    #   ch.confirm_select(tracking: true)
+    #   messages = 100.times.map { |i| "message #{i}" }
+    #   ch.basic_publish_batch(messages, "", queue.name)
+    #
+    # @api public
+    def basic_publish_batch(payloads, exchange, routing_key, opts = {})
+      raise_if_no_longer_open!
+      raise ArgumentError, "payloads must be an Array" unless payloads.is_a?(Array)
+      raise ArgumentError, "routing key cannot be longer than #{SHORTSTR_LIMIT} characters" if routing_key && routing_key.size > SHORTSTR_LIMIT
+      return self if payloads.empty?
+
+      exchange_name = if exchange.respond_to?(:name)
+                        exchange.name
+                      else
+                        exchange
+                      end
+
+      mode = opts.fetch(:persistent, true) ? 2 : 1
+      opts = opts.dup
+      opts[:delivery_mode] ||= mode
+      opts[:content_type]  ||= DEFAULT_CONTENT_TYPE
+      opts[:priority]      ||= 0
+
+      batch_size = payloads.size
+
+      if @next_publish_seq_no > 0
+        @unconfirmed_set_mutex.synchronize do
+          # With throttling: wait until we have room for the batch
+          if @throttle_publishes
+            limit = @outstanding_limit
+            target = [limit - batch_size, 0].max
+            timeout_sec = (@confirm_timeout || @connection.continuation_timeout) / 1000.0
+            deadline = nil
+
+            while @unconfirmed_set.size > target
+              raise_if_no_longer_open!
+              deadline ||= Bunny::Timestamp.monotonic + timeout_sec
+              remaining = deadline - Bunny::Timestamp.monotonic
+              raise Timeout::Error, "Timed out waiting for publisher confirms (batch: #{batch_size}, limit: #{limit})" if remaining <= 0
+              @outstanding_limit_cond.wait(remaining)
+            end
+          end
+
+          # Register all sequence numbers at once
+          start_seq = @next_publish_seq_no
+          batch_size.times { |i| @unconfirmed_set.add(start_seq + i) }
+          @next_publish_seq_no = start_seq + batch_size
+        end
+      end
+
+      # Encode all messages into a single buffer and write once
+      data = +""
+      payloads.each do |payload|
+        frames = AMQ::Protocol::Basic::Publish.encode(@id,
+          payload,
+          opts,
+          exchange_name,
+          routing_key,
+          opts[:mandatory],
+          false,
+          @frame_max)
+        frames.each { |frame| data << frame.encode }
+      end
+      @connection.send_raw_without_timeout(data, self)
 
       self
     end
@@ -753,19 +1045,19 @@ module Bunny
     # @see Bunny::Channel#prefetch
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
-    def basic_qos(count, global = false)
-      raise ArgumentError.new("prefetch count must be a positive integer, given: #{count}") if count < 0
-      raise ArgumentError.new("prefetch count must be no greater than #{MAX_PREFETCH_COUNT}, given: #{count}") if count > MAX_PREFETCH_COUNT
+    def basic_qos(prefetch_count, global = false)
+      raise ArgumentError.new("prefetch count must be a positive integer, given: #{prefetch_count}") if prefetch_count < 0
+      raise ArgumentError.new("prefetch count must be no greater than #{MAX_PREFETCH_COUNT}, given: #{prefetch_count}") if prefetch_count > MAX_PREFETCH_COUNT
       raise_if_no_longer_open!
 
-      @connection.send_frame(AMQ::Protocol::Basic::Qos.encode(@id, 0, count, global))
+      @connection.send_frame(AMQ::Protocol::Basic::Qos.encode(@id, 0, prefetch_count, global))
 
       with_continuation_timeout do
         @last_basic_qos_ok = wait_on_continuations
       end
       raise_if_continuation_resulted_in_a_channel_error!
 
-      @prefetch_count  = count
+      @prefetch_count  = prefetch_count
       @prefetch_global = global
 
       @last_basic_qos_ok
@@ -828,12 +1120,10 @@ module Bunny
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def basic_reject(delivery_tag, requeue = false)
-      guarding_against_stale_delivery_tags(delivery_tag) do
-        raise_if_no_longer_open!
-        @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, delivery_tag, requeue))
+      raise_if_no_longer_open!
+      @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, delivery_tag, requeue))
 
-        nil
-      end
+      nil
     end
 
     # Acknowledges a delivery (message).
@@ -952,7 +1242,7 @@ module Bunny
     # Registers a consumer for queue. Delivered messages will be handled with the block
     # provided to this method.
     #
-    # @param [String, Bunny::Queue] queue Queue to consume from
+    # @param [String] queue Queue to consume from
     # @param [String] consumer_tag Consumer tag (unique identifier), generated by Bunny by default
     # @param [Boolean] no_ack (false) If true, delivered messages will be automatically acknowledged.
     #                                 If false, manual acknowledgements will be necessary.
@@ -975,7 +1265,7 @@ module Bunny
       # helps avoid race condition between basic.consume-ok and basic.deliver if there are messages
       # in the queue already. MK.
       if consumer_tag && consumer_tag.strip != AMQ::Protocol::EMPTY_STRING
-        add_consumer(queue_name, consumer_tag, no_ack, exclusive, arguments, &block)
+        add_consumer(queue_name, consumer_tag, no_ack, exclusive, arguments || {}, &block)
       end
 
       @connection.send_frame(AMQ::Protocol::Basic::Consume.encode(@id,
@@ -995,6 +1285,8 @@ module Bunny
         # if basic.consume-ok never arrives, unregister the proactively
         # registered consumer. MK.
         unregister_consumer(@last_basic_consume_ok.consumer_tag)
+        # #add_consumer records a consumer, make sure to undo it here. MK.
+        delete_recorded_consumer(@last_basic_consume_ok.consumer_tag)
 
         raise e
       end
@@ -1004,7 +1296,7 @@ module Bunny
       raise_if_channel_close!(@last_basic_consume_ok)
 
       # covers server-generated consumer tags
-      add_consumer(queue_name, @last_basic_consume_ok.consumer_tag, no_ack, exclusive, arguments, &block)
+      add_consumer(queue_name, @last_basic_consume_ok.consumer_tag, no_ack, exclusive, arguments || {}, &block)
 
       @last_basic_consume_ok
     end
@@ -1055,6 +1347,12 @@ module Bunny
 
       # covers server-generated consumer tags
       register_consumer(@last_basic_consume_ok.consumer_tag, consumer)
+      record_consumer_with(self, @last_basic_consume_ok.consumer_tag,
+        consumer.queue_name,
+        consumer,
+        consumer.manual_acknowledgement?,
+        consumer.exclusive,
+        consumer.arguments)
 
       raise_if_continuation_resulted_in_a_channel_error!
 
@@ -1066,12 +1364,12 @@ module Bunny
     # it was on is auto-deleted and this consumer was the last one, the queue will be deleted.
     #
     # @param [String] consumer_tag Consumer tag (unique identifier) to cancel
-    # @param [Hash] arguments ({}) Optional arguments
+    # @param [Hash] opts ({}) Optional arguments
     #
     # @option opts [Boolean] :no_wait (false) if set to true, this method won't receive a response and will
     #                                         immediately return nil
     #
-    # @return [AMQ::Protocol::Basic::CancelOk] RabbitMQ response or nil, if the no_wait option is used
+    # @return [AMQ::Protocol::Basic::CancelOk, nil] RabbitMQ response or nil, if the no_wait option is used
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def basic_cancel(consumer_tag, opts = {})
@@ -1089,6 +1387,7 @@ module Bunny
       # reduces thread usage for channels that don't have any
       # consumers
       @work_pool.shutdown(true) unless self.any_consumers?
+      self.delete_recorded_consumer(consumer_tag)
 
       @last_basic_cancel_ok
     end
@@ -1123,6 +1422,26 @@ module Bunny
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def queue_declare(name, opts = {})
+      # strip trailing new line and carriage returns
+      # just like RabbitMQ does
+      safe_name = name.gsub(/[\r\n]/, "")
+      is_server_named = (safe_name == AMQ::Protocol::EMPTY_STRING)
+      passive = opts.fetch(:passive, false)
+      durable = opts.fetch(:durable, false)
+      exclusive = opts.fetch(:exclusive, false)
+      auto_delete = opts.fetch(:auto_delete, false)
+      args = opts[:arguments]
+
+      result = self.queue_declare_without_recording_topology(name, opts)
+      self.record_queue_with(self, result.queue, is_server_named, durable, exclusive, auto_delete, args) unless passive
+
+      result
+    end
+
+    # We need this bypassing topology version to avoid modifying the collections
+    # as we iterate over them during topology recovery.
+    # @private
+    def queue_declare_without_recording_topology(name, opts = {})
       raise_if_no_longer_open!
 
       Bunny::Queue.verify_type!(opts[:arguments]) if opts[:arguments]
@@ -1130,16 +1449,24 @@ module Bunny
       # strip trailing new line and carriage returns
       # just like RabbitMQ does
       safe_name = name.gsub(/[\r\n]/, "")
+      is_server_named = (safe_name == AMQ::Protocol::EMPTY_STRING)
       @pending_queue_declare_name = safe_name
+
+      passive = opts.fetch(:passive, false)
+      durable = opts.fetch(:durable, false)
+      exclusive = opts.fetch(:exclusive, false)
+      auto_delete = opts.fetch(:auto_delete, false)
+      args = opts[:arguments]
+
       @connection.send_frame(
         AMQ::Protocol::Queue::Declare.encode(@id,
           @pending_queue_declare_name,
-          opts.fetch(:passive, false),
-          opts.fetch(:durable, false),
-          opts.fetch(:exclusive, false),
-          opts.fetch(:auto_delete, false),
+          passive,
+          durable,
+          exclusive,
+          auto_delete,
           false,
-          opts[:arguments]))
+          args))
 
       begin
         with_continuation_timeout do
@@ -1177,6 +1504,8 @@ module Bunny
         @last_queue_delete_ok = wait_on_continuations
       end
       raise_if_continuation_resulted_in_a_channel_error!
+      self.delete_recorded_queue_named(name)
+      self.deregister_queue_named(name)
 
       @last_queue_delete_ok
     end
@@ -1222,18 +1551,43 @@ module Bunny
                       else
                         exchange
                       end
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
 
+      result = self.queue_bind_without_recording_topology(name, exchange, opts)
+      self.record_queue_binding_with(self, exchange_name, name, rk, args)
+
+      result
+    end
+
+    # We need this bypassing topology version to avoid modifying the collections
+    # as we iterate over them during topology recovery.
+    # @private
+    def queue_bind_without_recording_topology(name, exchange, opts = {})
+      raise_if_no_longer_open!
+
+      exchange_name = if exchange.respond_to?(:name)
+                        exchange.name
+                      else
+                        exchange
+                      end
+
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
       @connection.send_frame(AMQ::Protocol::Queue::Bind.encode(@id,
-          name,
-          exchange_name,
-          (opts[:routing_key] || opts[:key]),
-          false,
-          opts[:arguments]))
+        name,
+        exchange_name,
+        rk,
+        false,
+        args))
+
       with_continuation_timeout do
         @last_queue_bind_ok = wait_on_continuations
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+
+
       @last_queue_bind_ok
     end
 
@@ -1259,16 +1613,20 @@ module Bunny
                         exchange
                       end
 
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
       @connection.send_frame(AMQ::Protocol::Queue::Unbind.encode(@id,
           name,
           exchange_name,
-          opts[:routing_key],
-          opts[:arguments]))
+          rk,
+          args))
       with_continuation_timeout do
         @last_queue_unbind_ok = wait_on_continuations
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+      self.delete_recorded_queue_binding(self, exchange_name, name, rk, args)
+
       @last_queue_unbind_ok
     end
 
@@ -1294,25 +1652,65 @@ module Bunny
     # @see http://rubybunny.info/articles/exchanges.html Exchanges and Publishing guide
     # @api public
     def exchange_declare(name, type, opts = {})
+      result = self.exchange_declare_without_recording_topology(name, type, opts)
+
+      # strip trailing new line and carriage returns
+      # just like RabbitMQ does
+      safe_name = name.gsub(/[\r\n]/, "")
+      passive = opts.fetch(:passive, false)
+      durable = opts.fetch(:durable, false)
+      auto_delete = opts.fetch(:auto_delete, false)
+      args = opts[:arguments]
+      self.record_exchange_with(self,
+        safe_name,
+        type.to_s,
+        durable,
+        auto_delete,
+        args) unless passive
+
+      result
+    end
+
+    # We need this bypassing topology version to avoid modifying the collections
+    # as we iterate over them during topology recovery.
+    #
+    # @param [String] name The name of the exchange. Note that LF and CR characters
+    #                       will be stripped from the value.
+    # @param [String,Symbol] type Exchange type, e.g. :fanout or :topic
+    # @param [Hash] opts Exchange properties
+    #
+    # @option opts [Boolean] durable (false)     Should information about this exchange be persisted to disk so that it
+    #                                            can survive broker restarts? Typically set to true for long-lived exchanges.
+    # @option opts [Boolean] auto_delete (false) Should this exchange be deleted when it is no longer used?
+    # @option opts [Boolean] passive (false)   If true, exchange will be checked for existence. If it does not
+    #                                          exist, {Bunny::NotFound} will be raised.
+    # @private
+    def exchange_declare_without_recording_topology(name, type, opts = {})
       raise_if_no_longer_open!
 
       # strip trailing new line and carriage returns
       # just like RabbitMQ does
       safe_name = name.gsub(/[\r\n]/, "")
+      passive = opts.fetch(:passive, false)
+      durable = opts.fetch(:durable, false)
+      auto_delete = opts.fetch(:auto_delete, false)
+      args = opts[:arguments]
+
       @connection.send_frame(AMQ::Protocol::Exchange::Declare.encode(@id,
           safe_name,
           type.to_s,
-          opts.fetch(:passive, false),
-          opts.fetch(:durable, false),
-          opts.fetch(:auto_delete, false),
+          passive,
+          durable,
+          auto_delete,
           opts.fetch(:internal, false),
           opts.fetch(:no_wait, false),
-          opts[:arguments]))
+          args))
       with_continuation_timeout do
         @last_exchange_declare_ok = wait_on_continuations
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+
       @last_exchange_declare_ok
     end
 
@@ -1338,6 +1736,9 @@ module Bunny
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+      self.delete_recorded_exchange_named(name)
+      self.deregister_exchange_named(name)
+
       @last_exchange_delete_ok
     end
 
@@ -1357,6 +1758,29 @@ module Bunny
     # @see http://rubybunny.info/articles/extensions.html RabbitMQ Extensions guide
     # @api public
     def exchange_bind(source, destination, opts = {})
+      result = self.exchange_bind_without_recording_topology(source, destination, opts)
+
+      source_name = if source.respond_to?(:name)
+                      source.name
+                    else
+                      source
+                    end
+      destination_name = if destination.respond_to?(:name)
+                           destination.name
+                         else
+                           destination
+                         end
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
+      self.record_exchange_binding_with(self, source_name, destination_name, rk, args)
+
+      result
+    end
+
+    # We need this bypassing topology version to avoid modifying the collections
+    # as we iterate over them during topology recovery.
+    # @private
+    def exchange_bind_without_recording_topology(source, destination, opts = {})
       raise_if_no_longer_open!
 
       source_name = if source.respond_to?(:name)
@@ -1371,17 +1795,21 @@ module Bunny
                            destination
                          end
 
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
       @connection.send_frame(AMQ::Protocol::Exchange::Bind.encode(@id,
           destination_name,
           source_name,
-          opts[:routing_key],
+          rk,
           false,
-          opts[:arguments]))
+          args))
       with_continuation_timeout do
         @last_exchange_bind_ok = wait_on_continuations
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+      self.record_exchange_binding_with(self, source_name, destination_name, rk, args)
+
       @last_exchange_bind_ok
     end
 
@@ -1415,17 +1843,21 @@ module Bunny
                            destination
                          end
 
+      rk = (opts[:routing_key] || opts[:key])
+      args = opts[:arguments]
       @connection.send_frame(AMQ::Protocol::Exchange::Unbind.encode(@id,
           destination_name,
           source_name,
-          opts[:routing_key],
+          rk,
           false,
-          opts[:arguments]))
+          args))
       with_continuation_timeout do
         @last_exchange_unbind_ok = wait_on_continuations
       end
 
       raise_if_continuation_resulted_in_a_channel_error!
+      self.delete_recorded_exchange_binding(self, source_name, destination_name, rk, args)
+
       @last_exchange_unbind_ok
     end
 
@@ -1528,14 +1960,25 @@ module Bunny
     alias using_publisher_confirms? using_publisher_confirmations?
 
     # Enables publisher confirms for the channel.
+    #
+    # @param [Proc] callback Optional callback invoked for each confirm. Receives (delivery_tag, multiple, nack).
+    # @param [Boolean] tracking When true, basic_publish blocks until the broker confirms receipt.
+    #   Raises Bunny::MessageNacked if the message is nacked.
+    # @param [Integer] outstanding_limit Max unconfirmed messages before basic_publish blocks.
+    #   Defaults to 1000 when tracking: true (optimal for throughput). Pass explicit value to override.
+    # @param [Integer] confirm_timeout Timeout in ms for confirms. Defaults to connection's continuation_timeout.
+    #
     # @return [AMQ::Protocol::Confirm::SelectOk] RabbitMQ response
     # @see #wait_for_confirms
     # @see #unconfirmed_set
     # @see #nacked_set
     # @see http://rubybunny.info/articles/extensions.html RabbitMQ Extensions guide
     # @api public
-    def confirm_select(callback = nil)
+    def confirm_select(callback = nil, tracking: false, outstanding_limit: nil, confirm_timeout: nil)
       raise_if_no_longer_open!
+      raise ArgumentError, "outstanding_limit requires tracking: true" if outstanding_limit && !tracking
+      raise ArgumentError, "outstanding_limit must be positive" if outstanding_limit && outstanding_limit < 1
+      raise ArgumentError, "confirm_timeout must be positive" if confirm_timeout && confirm_timeout < 1
 
       if @next_publish_seq_no == 0
         @confirms_continuations = new_continuation
@@ -1546,6 +1989,17 @@ module Bunny
       end
 
       @confirms_callback = callback
+      @confirms_tracking_enabled = tracking
+      # Default to optimal limit when tracking enabled (avoids per-message mutex)
+      @outstanding_limit = outstanding_limit || (tracking ? DEFAULT_OUTSTANDING_CONFIRMS_LIMIT : nil)
+      @confirm_timeout = confirm_timeout
+
+      # Cache combined check for fast path in basic_publish
+      @throttle_publishes = tracking && @outstanding_limit
+
+      if @outstanding_limit && !@outstanding_limit_cond
+        @outstanding_limit_cond = @unconfirmed_set_mutex.new_cond
+      end
 
       @connection.send_frame(AMQ::Protocol::Confirm::Select.encode(@id, false))
       with_continuation_timeout do
@@ -1585,9 +2039,9 @@ module Bunny
     #
     # @return [String]  Unique string.
     # @api plugin
-    def generate_consumer_tag(name = "bunny")
+    def generate_consumer_tag(prefix = "bunny")
       t = Bunny::Timestamp.now
-      "#{name}-#{t.to_i * 1000}-#{Kernel.rand(999_999_999_999)}"
+      "#{prefix}-#{t.to_i * 1000}-#{Kernel.rand(999_999_999_999)}"
     end
 
     # @endgroup
@@ -1630,11 +2084,8 @@ module Bunny
       recover_prefetch_setting
       recover_confirm_mode
       recover_tx_mode
-      recover_exchanges
-      # this includes recovering bindings
-      recover_queues
-      recover_consumers
-      increment_recoveries_counter
+
+      # Topology is now recovered by [Bunny::Session] via the data in [Bunny::TopologyRegistry].
     end
 
     # Recovers basic.qos setting. Used by the Automatic Network Failure
@@ -1651,13 +2102,26 @@ module Bunny
     #
     # @api plugin
     def recover_confirm_mode
-      if using_publisher_confirmations?
-        @unconfirmed_set_mutex.synchronize do
-          @unconfirmed_set.clear
-          @delivery_tag_offset = @next_publish_seq_no - 1
+      return unless using_publisher_confirmations?
+
+      @unconfirmed_set_mutex.synchronize do
+        @unconfirmed_set.clear
+        @delivery_tag_offset = @next_publish_seq_no - 1
+
+        if @confirms_tracking_enabled
+          @per_message_continuations_mutex.synchronize do
+            @per_message_continuations.each_value { |c| c.push(:network_error) }
+            @per_message_continuations.clear
+          end
         end
-        confirm_select(@confirms_callback)
+
+        @outstanding_limit_cond&.broadcast
       end
+
+      confirm_select(@confirms_callback,
+                     tracking: @confirms_tracking_enabled,
+                     outstanding_limit: @outstanding_limit,
+                     confirm_timeout: @confirm_timeout)
     end
 
     # Recovers transaction mode. Used by the Automatic Network Failure
@@ -1668,45 +2132,31 @@ module Bunny
       tx_select if @tx_mode
     end
 
-    # Recovers exchanges. Used by the Automatic Network Failure
+    # Used by the Automatic Network Failure
     # Recovery feature.
     #
-    # @api plugin
-    def recover_exchanges
-      @exchange_mutex.synchronize { @exchanges.values }.each do |x|
-        x.recover_from_network_failure
+    # @param [String] old_name
+    # @param [String] new_name
+    # @private
+    def record_queue_name_change(old_name, new_name)
+      @queue_mutex.synchronize do
+        if (orig = @queues[old_name])
+          @queues.delete(old_name)
+
+          orig.update_name_to(new_name)
+          @queues[new_name] = orig.dup
+        end
       end
     end
 
-    # Recovers queues and bindings. Used by the Automatic Network Failure
-    # Recovery feature.
+    # Used by the Automatic Network Failure Recovery feature.
     #
-    # @api plugin
-    def recover_queues
-      @queue_mutex.synchronize { @queues.values }.each do |q|
-        @logger.debug { "Recovering queue #{q.name}" }
-        q.recover_from_network_failure
-      end
-    end
-
-    # Recovers consumers. Used by the Automatic Network Failure
-    # Recovery feature.
-    #
-    # @api plugin
-    def recover_consumers
+    # @api private
+    def maybe_reinitialize_consumer_pool!
       unless @consumers.empty?
         @work_pool = ConsumerWorkPool.new(@work_pool.size, @work_pool.abort_on_exception)
         @work_pool.start
       end
-
-      @consumer_mutex.synchronize { @consumers.values }.each do |c|
-        c.recover_from_network_failure
-      end
-    end
-
-    # @private
-    def increment_recoveries_counter
-      @recoveries_counter.increment
     end
 
     # @api public
@@ -1745,6 +2195,9 @@ module Bunny
     def register_consumer(consumer_tag, consumer)
       @consumer_mutex.synchronize do
         @consumers[consumer_tag] = consumer
+        if @last_consumer_tag == consumer_tag
+          @last_consumer = consumer
+        end
       end
     end
 
@@ -1752,16 +2205,46 @@ module Bunny
     def unregister_consumer(consumer_tag)
       @consumer_mutex.synchronize do
         @consumers.delete(consumer_tag)
+        if @last_consumer_tag == consumer_tag
+          @last_consumer_tag = nil
+          @last_consumer = nil
+        end
       end
     end
 
+    # @param [String] queue_name
+    # @param [String] consumer_tag
+    # @param [Boolean] no_ack true means automative acknowledgement mode
+    # @param [Boolean] exclusive
+    # @param [Hash] arguments
     # @private
-    def add_consumer(queue, consumer_tag, no_ack, exclusive, arguments, &block)
+    def add_consumer(queue_name, consumer_tag, no_ack, exclusive, arguments, &block)
       @consumer_mutex.synchronize do
-        c = Consumer.new(self, queue, consumer_tag, no_ack, exclusive, arguments)
+        c = Consumer.new(self, queue_name, consumer_tag, no_ack, exclusive, arguments)
         c.on_delivery(&block) if block
         @consumers[consumer_tag] = c
+        if @last_consumer_tag == consumer_tag
+          @last_consumer = c
+        end
+        c
       end
+      record_consumer_with(self, consumer_tag,
+          queue_name,
+          block,
+          !no_ack,
+          exclusive,
+          arguments)
+    end
+
+    # @private
+    def pending_server_named_queue_declaration?
+      @pending_queue_declare_name && @pending_queue_declare_name.empty?
+    end
+
+    # @private
+    def can_accept_queue_declare_ok?(method)
+      @pending_queue_declare_name == method.queue ||
+        pending_server_named_queue_declaration?
     end
 
     # @private
@@ -1826,6 +2309,10 @@ module Bunny
                 consume_with(consumer)
               else
                 @consumers.delete(method.consumer_tag)
+                if @last_consumer_tag == method.consumer_tag
+                  @last_consumer_tag = nil
+                  @last_consumer = nil
+                end
                 consumer.handle_cancellation(method)
               end
             rescue Exception => e
@@ -1839,6 +2326,7 @@ module Bunny
       when AMQ::Protocol::Basic::CancelOk then
         @continuations.push(method)
         unregister_consumer(method.consumer_tag)
+        delete_recorded_consumer(method.consumer_tag)
       when AMQ::Protocol::Tx::SelectOk, AMQ::Protocol::Tx::CommitOk, AMQ::Protocol::Tx::RollbackOk then
         @continuations.push(method)
       when AMQ::Protocol::Tx::SelectOk then
@@ -1855,7 +2343,9 @@ module Bunny
 
         # basic.ack, basic.reject, basic.nack. MK.
         if channel_level_exception_after_operation_that_has_no_response?(method)
-          @on_error.call(self, method) if @on_error
+          # Runs outside the reader loop so that the callback can perform
+          # blocking operations such as channel.reopen.
+          Thread.new { @on_error.call(self, method) } if @on_error
         else
           @last_channel_error = instantiate_channel_level_exception(method)
           @continuations.push(method)
@@ -1870,12 +2360,12 @@ module Bunny
 
     # @private
     def channel_level_exception_after_operation_that_has_no_response?(method)
-      method.reply_code == 406 && (method.reply_text =~ /unknown delivery tag/ || method.reply_text =~ /delivery acknowledgement on channel \d+ timed out/)
+      method.unknown_delivery_tag? || method.delivery_ack_timeout? || method.message_too_large?
     end
 
     # @private
     def handle_basic_get_ok(basic_get_ok, properties, content)
-      basic_get_ok.delivery_tag = VersionedDeliveryTag.new(basic_get_ok.delivery_tag, @recoveries_counter.get)
+      basic_get_ok.delivery_tag = basic_get_ok.delivery_tag
       @basic_get_continuations.push([basic_get_ok, properties, content])
     end
 
@@ -1886,17 +2376,30 @@ module Bunny
 
     # @private
     def handle_frameset(basic_deliver, properties, content)
-      consumer = @consumers[basic_deliver.consumer_tag]
+      tag = basic_deliver.consumer_tag
+      if @last_consumer_tag == tag
+        consumer = @last_consumer
+      else
+        consumer = @consumers[tag]
+        @last_consumer_tag = tag
+        @last_consumer = consumer
+      end
+
       if consumer
         @work_pool.submit do
-          begin
-            consumer.call(DeliveryInfo.new(basic_deliver, consumer, self), MessageProperties.new(properties), content)
-          rescue StandardError => e
-            @uncaught_exception_handler.call(e, consumer) if @uncaught_exception_handler
-          end
+          deliver_to_consumer(consumer, basic_deliver, properties, content)
         end
       else
         @logger.warn "No consumer for tag #{basic_deliver.consumer_tag} on channel #{@id}!"
+      end
+    end
+
+    # @private
+    def deliver_to_consumer(consumer, basic_deliver, properties, content)
+      begin
+        consumer.call(DeliveryInfo.new(basic_deliver, consumer, self), MessageProperties.new(properties), content)
+      rescue StandardError => e
+        @uncaught_exception_handler.call(e, consumer) if @uncaught_exception_handler
       end
     end
 
@@ -1930,6 +2433,22 @@ module Bunny
         @only_acks_received = (@only_acks_received && !nack)
 
         @confirms_continuations.push(true) if @unconfirmed_set.empty?
+
+        # Signal per-message continuations (only used when tracking without limit)
+        if @confirms_tracking_enabled && !@throttle_publishes
+          to_signal = []
+          @per_message_continuations_mutex.synchronize do
+            @per_message_continuations.each do |tag, cont|
+              to_signal << cont if tag >= confirmed_range_start && tag <= confirmed_range_end
+            end
+          end
+          result = nack ? :nack : :ack
+          to_signal.each { |c| c.push(result) }
+        end
+
+        # Wake publisher(s) waiting for outstanding limit slot
+        # Use broadcast since "multiple" acks can free many slots at once
+        @outstanding_limit_cond&.broadcast if @throttle_publishes
 
         if @confirms_callback
           confirmed_range.each { |tag| @confirms_callback.call(tag, false, nack) }
@@ -2005,21 +2524,63 @@ module Bunny
       end
     end
 
+    # Waits for a slot when outstanding limit is reached.
+    # Assumes @unconfirmed_set_mutex is already held.
+    # @private
+    def wait_for_outstanding_slot_locked
+      limit = @outstanding_limit
+      return if @unconfirmed_set.size < limit
 
-    # Releases all continuations. Used by automatic network recovery.
+      timeout_sec = (@confirm_timeout || @connection.continuation_timeout) / 1000.0
+      deadline = Bunny::Timestamp.monotonic + timeout_sec
+
+      while @unconfirmed_set.size >= limit
+        raise_if_no_longer_open!
+
+        remaining = deadline - Bunny::Timestamp.monotonic
+        raise Timeout::Error, "Timed out waiting for publisher confirms (limit: #{limit})" if remaining <= 0
+
+        @outstanding_limit_cond.wait(remaining)
+      end
+    end
+
+    # @private
+    def wait_for_publish_confirm(seq_no, continuation)
+      t = Thread.current
+      @threads_waiting_on_confirms_continuations << t
+
+      begin
+        timeout = @confirm_timeout || @connection.continuation_timeout
+        case continuation.poll(timeout)
+        when :ack, true
+          # confirmed
+        when :nack
+          raise MessageNacked.new("Message #{seq_no} was nacked", seq_no)
+        when :network_error
+          raise NetworkFailure.new("Network failure waiting for confirm", nil)
+        when nil
+          raise Timeout::Error, "Timed out waiting for publisher confirm"
+        end
+      ensure
+        @threads_waiting_on_confirms_continuations.delete(t)
+        @per_message_continuations_mutex.synchronize do
+          @per_message_continuations.delete(seq_no)
+        end
+      end
+    end
+
+
     # @private
     def release_all_continuations
-      @threads_waiting_on_confirms_continuations.each do |t|
-        t.run
-      end
-      @threads_waiting_on_continuations.each do |t|
-        t.run
-      end
-      @threads_waiting_on_basic_get_continuations.each do |t|
-        t.run
+      @threads_waiting_on_confirms_continuations.each(&:run)
+      @threads_waiting_on_continuations.each(&:run)
+      @threads_waiting_on_basic_get_continuations.each(&:run)
+
+      if @outstanding_limit_cond
+        @unconfirmed_set_mutex.synchronize { @outstanding_limit_cond.broadcast }
       end
 
-      self.reset_continuations
+      reset_continuations
     end
 
     # Starts consumer work pool. Lazily called by #basic_consume to avoid creating new threads
@@ -2049,39 +2610,167 @@ module Bunny
       @connection.read_next_frame(options = {})
     end
 
-    # @private
-    def deregister_queue(queue)
-      @queue_mutex.synchronize { @queues.delete(queue.name) }
-    end
-
-    # @private
-    def deregister_queue_named(name)
-      @queue_mutex.synchronize { @queues.delete(name) }
-    end
-
-    # @private
-    def register_queue(queue)
-      @queue_mutex.synchronize { @queues[queue.name] = queue }
-    end
-
+    # @param [String] name
     # @private
     def find_queue(name)
       @queue_mutex.synchronize { @queues[name] }
     end
 
+    # @param [String] name
     # @private
-    def deregister_exchange(exchange)
-      @exchange_mutex.synchronize { @exchanges.delete(exchange.name) }
+    def find_exchange(name)
+      @exchange_mutex.synchronize { @exchanges[name] }
     end
 
+    # @param [Bunny::Queue] queue
+    # @private
+    def register_queue(queue)
+      @queue_mutex.synchronize { @queues[queue.name] = queue }
+    end
+
+    # @param [Bunny::Queue] queue
+    # @private
+    def deregister_queue(queue)
+      @queue_mutex.synchronize { @queues.delete(queue.name) }
+    end
+
+    # @param [Bunny::String] name
+    # @private
+    def deregister_queue_named(name)
+      @queue_mutex.synchronize { @queues.delete(name) }
+    end
+
+    # @param [Bunny::Queue] queue
+    # @private
+    def record_queue(queue)
+      @connection.record_queue(queue)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] name
+    # @param [Boolean] server_named
+    # @param [Boolean] durable
+    # @param [Boolean] auto_delete
+    # @param [Boolean] exclusive
+    # @param [Hash] arguments
+    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+      @connection.record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+    end
+
+    # @param [Bunny::Queue, Bunny::RecordedQueue] queue
+    # @private
+    def delete_recoreded_queue(queue)
+      @connection.delete_recorded_queue(queue)
+    end
+
+    # @param [String] name
+    # @private
+    def delete_recorded_queue_named(name)
+      @connection.delete_recorded_queue_named(name)
+    end
+
+    # @param [Bunny::Exchange] exchange
     # @private
     def register_exchange(exchange)
       @exchange_mutex.synchronize { @exchanges[exchange.name] = exchange }
     end
 
+    # @param [Bunny::Exchange] exchange
     # @private
-    def find_exchange(name)
-      @exchange_mutex.synchronize { @exchanges[name] }
+    def deregister_exchange(exchange)
+      @queue_mutex.synchronize { @exchanges.delete(exchange.name) }
+    end
+
+    # @param [String] name
+    # @private
+    def deregister_exchange_named(name)
+      @queue_mutex.synchronize { @exchanges.delete(name) }
+    end
+
+    # @param [Bunny::Exchange] exchange
+    # @private
+    def record_exchange(exchange)
+      @connection.record_exchange(exchange)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] name
+    # @param [String] type
+    # @param [Boolean] durable
+    # @param [Boolean] auto_delete
+    # @param [Hash] arguments
+    def record_exchange_with(ch, name, type, durable, auto_delete, arguments)
+      @connection.record_exchange_with(ch, name, type, durable, auto_delete, arguments)
+    end
+
+    # @param [Bunny::Exchange] exchange
+    # @private
+    def delete_recorded_exchange(exchange)
+      @connection.delete_recorded_exchange(exchange)
+    end
+
+    # @param [String] name
+    # @private
+    def delete_recorded_exchange_named(name)
+      @connection.delete_recorded_exchange_named(name)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] exchange_name
+    # @param [String] queue_name
+    # @param [String] routing_key
+    # @param [Hash] arguments
+    # @private
+    def record_queue_binding_with(ch, exchange_name, queue_name, routing_key, arguments)
+      @connection.record_queue_binding_with(ch, exchange_name, queue_name, routing_key, arguments)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] exchange_name
+    # @param [String] queue_name
+    # @param [String] routing_key
+    # @param [Hash] arguments
+    # @private
+    def delete_recorded_queue_binding(ch, exchange_name, queue_name, routing_key, arguments)
+      @connection.delete_recorded_queue_binding(ch, exchange_name, queue_name, routing_key, arguments)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] source_name
+    # @param [String] destination_name
+    # @param [String] routing_key
+    # @param [Hash] arguments
+    # @private
+    def record_exchange_binding_with(ch, source_name, destination_name, routing_key, arguments)
+      @connection.record_exchange_binding_with(ch, source_name, destination_name, routing_key, arguments)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] source_name
+    # @param [String] destination_name
+    # @param [String] routing_key
+    # @param [Hash] arguments
+    # @private
+    def delete_recorded_exchange_binding(ch, source_name, destination_name, routing_key, arguments)
+      @connection.delete_recorded_exchange_binding(ch, source_name, destination_name, routing_key, arguments)
+    end
+
+    # @param [Bunny::Channel] ch
+    # @param [String] consumer_tag
+    # @param [String] queue_name
+    # @param [#call] callable
+    # @param [Boolean] manual_ack
+    # @param [Boolean] exclusive
+    # @param [Hash] arguments
+    # @private
+    def record_consumer_with(ch, consumer_tag, queue_name, callable, manual_ack, exclusive, arguments)
+      @connection.record_consumer_with(ch, consumer_tag, queue_name, callable, manual_ack, exclusive, arguments)
+    end
+
+    # @param [String] consumer_tag
+    # @private
+    def delete_recorded_consumer(consumer_tag)
+      @connection.delete_recorded_consumer(consumer_tag)
     end
 
     protected
@@ -2148,6 +2837,7 @@ module Bunny
       @continuations           = new_continuation
       @confirms_continuations  = new_continuation
       @basic_get_continuations = new_continuation
+      @per_message_continuations_mutex.synchronize { @per_message_continuations.clear }
     end
 
     # @private
@@ -2158,16 +2848,7 @@ module Bunny
     # @private
     def guarding_against_stale_delivery_tags(tag, &block)
       case tag
-        # if a fixnum was passed, execute unconditionally. MK.
-      when Integer then
-        block.call
-        # versioned delivery tags should be checked to avoid
-        # sending out stale (invalid) tags after channel was reopened
-        # during network failure recovery. MK.
-      when VersionedDeliveryTag then
-        if !tag.stale?(@recoveries_counter.get)
-          block.call
-        end
+      when Integer then block.call
       end
     end
   end # Channel

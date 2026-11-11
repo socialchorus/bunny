@@ -972,8 +972,8 @@ conn.start
 ch   = conn.create_channel
 x    = ch.headers("headers")
 
-q1   = ch.queue("", :exclusive => true).bind(x, :arguments => {"os" => "linux", "cores" => 8, "x-match" => "all"})
-q2   = ch.queue("", :exclusive => true).bind(x, :arguments => {"os" => "osx",   "cores" => 4, "x-match" => "any"})
+q1   = ch.queue("headers.q1.linux.8cores").bind(x, :arguments => {"os" => "linux", "cores" => 8, "x-match" => "all"})
+q2   = ch.queue("headers.q2.macos.any", exclusive: true).bind(x, :arguments => {"os" => "macos",   "cores" => 4, "x-match" => "any"})
 
 q1.subscribe do |delivery_info, properties, content|
   puts "#{q1.name} received #{content}"
@@ -983,7 +983,7 @@ q2.subscribe do |delivery_info, properties, content|
 end
 
 x.publish("8 cores/Linux", :headers => {"os" => "linux", "cores" => 8})
-x.publish("8 cores/OS X",  :headers => {"os" => "osx",   "cores" => 8})
+x.publish("8 cores/OS X",  :headers => {"os" => "macos",   "cores" => 8})
 x.publish("4 cores/Linux", :headers => {"os" => "linux", "cores" => 4})
 
 sleep 0.5
@@ -1079,18 +1079,18 @@ A quote from the project README:
 > In various scenarios, you may wish to ensure that messages sent to an exchange are consistently and equally distributed across a number of different queues based on
 > the routing key of the message. You could arrange for this to occur yourself by using a direct or topic exchange, binding queues to that exchange and then publishing
 > messages to that exchange that match the various binding keys.
-> 
+>
 > However, arranging things this way can be problematic:
-> 
+>
 > It is difficult to ensure that all queues bound to the exchange will receive a (roughly) equal number of messages without baking in to the publishers quite a lot of
 > knowledge about the number of queues and their bindings.
-> 
+>
 > If the number of queues changes, it is not easy to ensure that the new topology still distributes messages between the different queues evenly.
-> 
+>
 > Consistent Hashing is a hashing technique whereby each bucket appears at multiple points throughout the hash space, and the bucket selected is the nearest
 > higher (or lower, it doesn't matter, provided it's consistent) bucket to the computed hash (and the hash space wraps around). The effect of this is that when a new
 > bucket is added or an existing bucket removed, only a very few hashes change which bucket they are routed to.
-> 
+>
 > In the case of Consistent Hashing as an exchange type, the hash is calculated from the hash of the routing key of each message received. Thus messages that have
 > the same routing key will have the same hash computed, and thus will be routed to the same queue, assuming no bindings have changed.
 
@@ -1107,39 +1107,67 @@ from the project README:
 This plugin is licensed under [Mozilla Public License
 1.1](http://www.mozilla.org/MPL/MPL-1.1.html), same as RabbitMQ.
 
-## Using the Publisher Confirms Extension
+## Publisher Confirms (Publisher Acknowledgements)
 
-Please refer to [RabbitMQ Extensions guide](/articles/extensions.html)
+The only reliable ways of making sure messages are not lost on the way to the broker
+are [publisher confirms](https://www.rabbitmq.com/docs/confirms) and transactions.
+Confirms are much more lightweight.
 
+### Publisher Confirm Tracking (Bunny 3.0+)
 
-### Message Acknowledgements and Their Relationship to Transactions and Publisher Confirms
+Enable confirm tracking on a channel with `Bunny::Channel#confirm_select`:
 
-Consumer applications (applications that receive and process messages)
-may occasionally fail to process individual messages, or might just
-crash. Additionally, network issues might be experienced. This raises
-a question - "when should the RabbitMQ remove messages from queues?"
-This topic is covered in depth in the [Queues
-guide](/articles/queues.html), including prefetching and examples.
+``` ruby
+ch.confirm_select(tracking: true)
+```
 
-In this guide, we will only mention how message acknowledgements are
-related to AMQP transactions and the Publisher Confirms extension. Let
-us consider a publisher application (P) that communications with a
-consumer (C) using AMQP 0.9.1. Their communication can be graphically
-represented like this:
+With tracking enabled, Bunny automatically applies backpressure when too many messages
+are unconfirmed. The default `outstanding_limit` is 1000. If the broker nacks a message,
+`Bunny::MessageNacked` is raised.
 
-<pre>
------       -----       -----
-|   |   S1  |   |   S2  |   |
-| P | ====> | B | ====> | C |
-|   |       |   |       |   |
------       -----       -----
-</pre>
+For best throughput when publishing groups of messages,
+use `basic_publish_batch`:
 
-We have two network segments, S1 and S2. Each of them may fail. A publisher (P) is concerned with making sure that messages cross S1, while the broker (B) and consumer (C) are concerned
-with ensuring that messages cross S2 and are only removed from the queue when they are processed successfully.
+``` ruby
+ch.confirm_select(tracking: true)
 
-Message acknowledgements cover reliable delivery over S2 as well as successful processing. For S1, P has to use transactions (a heavyweight solution) or the more
-lightweight Publisher Confirms, a RabbitMQ-specific extension.
+messages.each_slice(1000) do |batch|
+  ch.basic_publish_batch(batch, "", queue.name)
+end
+```
+
+Single-message publishing works too, just less efficiently
+when publishing groups (batches):
+
+``` ruby
+ch.confirm_select(tracking: true)
+messages.each { |msg| x.publish(msg, routing_key: q.name) }
+```
+
+### Without Tracking
+
+Without tracking, confirms are still available but you manage them yourself
+with `Bunny::Channel#wait_for_confirms`, a blocking method:
+
+``` ruby
+ch.confirm_select
+
+1000.times { x.publish("") }
+
+success = ch.wait_for_confirms
+unless success
+  ch.nacked_set.each do |n|
+    # handle the nacked message
+  end
+end
+```
+
+`wait_for_confirms` blocks until all outstanding messages are acked or nacked.
+Returns `false` if any were nacked. The nacked message IDs are in `channel.nacked_set`.
+
+### Learn More
+
+See RabbitMQ documentation on [Publisher Confirms](https://www.rabbitmq.com/docs/confirms) and [Publisher-side Data Safety](https://www.rabbitmq.com/docs/publishers#data-safety)
 
 
 ## Binding Queues to Exchanges

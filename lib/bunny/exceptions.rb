@@ -6,6 +6,9 @@ module Bunny
   class Exception < ::StandardError
   end
 
+  # Used when a list of endpoints (hostnames) to connect to
+  # has been fully traversed, that is, there are no more endpoints (hostnames)
+  # to try.
   class HostListDepleted < Exception
     def initialize
       super("No more hosts to try in the supplied list of hosts")
@@ -163,7 +166,7 @@ module Bunny
   class MessageError  < ConnectionLevelException; end
   # @private
   class ProtocolError < ConnectionLevelException; end
-  # Raised when RabbitMQ reports and internal error
+  # Raised when RabbitMQ reports an internal error
   class InternalError < ConnectionLevelException; end
 
   # Raised when read or write I/O operations time out (but only if
@@ -177,7 +180,7 @@ module Bunny
   class InconsistentDataError < Exception
   end
 
-  # Raised by adapters when frame does not end with {final octet AMQ::Protocol::Frame::FINAL_OCTET}.
+  # Raised by adapters when frame does not end with final octet [AMQ::Protocol::Frame::FINAL_OCTET].
   # This suggest that there is a bug in adapter or AMQ broker implementation.
   #
   # @see https://www.rabbitmq.com/resources/specs/amqp0-9-1.pdf AMQP 0.9.1 specification (Section 2.3)
@@ -206,6 +209,18 @@ module Bunny
       super(message)
 
       @channel = ch
+    end
+  end
+
+  # Raised when a published message is nacked by the broker
+  # and publisher confirm tracking is enabled.
+  # @api public
+  class MessageNacked < Exception
+    attr_reader :delivery_tag
+
+    def initialize(message, delivery_tag)
+      super(message)
+      @delivery_tag = delivery_tag
     end
   end
 
@@ -267,5 +282,19 @@ module Bunny
 
   # @private
   class MissingTLSKeyFile < Exception
+  end
+
+  # Exception wrapper that holds multiple accumulated exceptions.
+  # Raised by ExceptionAccumulator#raise_all! when multiple exceptions occurred.
+  #
+  # @api public
+  class AccumulatedExceptions < Exception
+    attr_reader :exceptions
+
+    def initialize(exceptions)
+      @exceptions = exceptions
+      messages = exceptions.map { |e| "#{e.class}: #{e.message}" }
+      super("#{exceptions.count} exception(s) accumulated:\n  #{messages.join("\n  ")}")
+    end
   end
 end

@@ -17,8 +17,10 @@ module Bunny
       QUORUM  = "quorum"
       CLASSIC = "classic"
       STREAM  = "stream"
+      DELAYED = "delayed"
+      JMS     = "jms"
 
-      KNOWN = [CLASSIC, QUORUM, STREAM]
+      KNOWN = [CLASSIC, QUORUM, STREAM, DELAYED, JMS]
 
       def self.known?(q_type)
         KNOWN.include?(q_type)
@@ -28,6 +30,13 @@ module Bunny
     module XArgs
       MAX_LENGTH = "x-max-length",
       QUEUE_TYPE = "x-queue-type"
+
+      DELAYED_RETRY_TYPE = "x-delayed-retry-type"
+      DELAYED_RETRY_MIN  = "x-delayed-retry-min"
+      DELAYED_RETRY_MAX  = "x-delayed-retry-max"
+
+      SELECTOR_FIELDS          = "x-selector-fields"
+      SELECTOR_FIELD_MAX_BYTES = "x-selector-field-max-bytes"
     end
 
     # @return [Bunny::Channel] Channel this queue uses
@@ -44,7 +53,7 @@ module Bunny
     # @option opts [Boolean] :durable (false)      Should this queue be durable?
     # @option opts [Boolean] :auto_delete (false)  Should this queue be automatically deleted when the last consumer disconnects?
     # @option opts [Boolean] :exclusive (false)    Should this queue be exclusive (only can be used by this connection, removed when the connection is closed)?
-    # @option opts [String] :type (nil)            Type of the declared queue (classic, quorum or stream)
+    # @option opts [String] :type (nil)            Type of the declared queue (classic, quorum, stream, delayed, or jms)
     # @option opts [Hash] :arguments (nil)         Additional optional arguments (typically used by RabbitMQ extensions and plugins)
     #
     # @see Bunny::Channel#queue
@@ -80,7 +89,10 @@ module Bunny
 
       declare! unless opts[:no_declare]
 
+      # for basic.deliver dispatch and such
       @channel.register_queue(self)
+      # for topology recovery
+      @channel.record_queue(self)
     end
 
     # @return [Boolean] true if this queue was declared as durable (will survive broker restart).
@@ -115,6 +127,13 @@ module Bunny
     # @api public
     def arguments
       @arguments
+    end
+
+    # @param value [String]
+    # @private
+    def update_name_to(value)
+      @name = value
+      self
     end
 
     def to_s
@@ -320,6 +339,7 @@ module Bunny
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def delete(opts = {})
+      @channel.delete_recorded_queue_named(self.name)
       @channel.deregister_queue(self)
       @channel.queue_delete(@name, opts)
     end
@@ -361,42 +381,6 @@ module Bunny
       throw ArgumentError.new(
         "unsupported queue type #{q_type.inspect}, supported ones: #{Types::KNOWN.join(', ')}") if (q_type and !Types.known?(q_type))
     end
-
-    #
-    # Recovery
-    #
-
-    # @private
-    def recover_from_network_failure
-      if self.server_named?
-        old_name = @name.dup
-        @name    = AMQ::Protocol::EMPTY_STRING
-
-        @channel.deregister_queue_named(old_name)
-      end
-
-      # TODO: inject and use logger
-      # puts "Recovering queue #{@name}"
-      begin
-        declare! unless @options[:no_declare]
-
-        @channel.register_queue(self)
-      rescue Exception => e
-        # TODO: inject and use logger
-        puts "Caught #{e.inspect} while redeclaring and registering #{@name}!"
-      end
-      recover_bindings
-    end
-
-    # @private
-    def recover_bindings
-      @bindings.each do |b|
-        # TODO: inject and use logger
-        # puts "Recovering binding #{b.inspect}"
-        self.bind(b[:exchange], b)
-      end
-    end
-
 
     #
     # Implementation

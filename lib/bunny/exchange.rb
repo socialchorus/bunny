@@ -10,6 +10,24 @@ module Bunny
   class Exchange
 
     #
+    # Exchange type constants
+    #
+
+    # Standard AMQP 0-9-1 exchange types
+    TYPE_DIRECT  = :direct
+    TYPE_FANOUT  = :fanout
+    TYPE_TOPIC   = :topic
+    TYPE_HEADERS = :headers
+
+    # In RabbitMQ core since 4.3.0
+    TYPE_MODULUS_HASH = :"x-modulus-hash"
+    # In RabbitMQ core since 4.2.0
+    TYPE_LOCAL_RANDOM = :"x-local-random"
+    # Provided by commonly used plugins
+    TYPE_CONSISTENT_HASH = :"x-consistent-hash"
+    TYPE_RANDOM = :"x-random"
+
+    #
     # API
     #
 
@@ -19,7 +37,7 @@ module Bunny
     # @return [String]
     attr_reader :name
 
-    # Type of this exchange (one of: :direct, :fanout, :topic, :headers).
+    # Type of this exchange (e.g. :direct, :fanout, :topic, :headers, :"x-consistent-hash", :"x-modulus-hash").
     # @return [Symbol]
     attr_reader :type
 
@@ -88,7 +106,10 @@ module Bunny
 
       declare! unless opts[:no_declare] || predeclared? || (@name == AMQ::Protocol::EMPTY_STRING)
 
+      # for basic.return dispatch and such
       @channel.register_exchange(self)
+      # for topology recovery
+      @channel.record_exchange(self)
     end
 
     # @return [Boolean] true if this exchange was declared as durable (will survive broker restart).
@@ -140,7 +161,8 @@ module Bunny
     # @see http://rubybunny.info/articles/exchanges.html Exchanges and Publishing guide
     # @api public
     def publish(payload, opts = {})
-      @channel.basic_publish(payload, self.name, (opts.delete(:routing_key) || opts.delete(:key)), opts)
+      rk = opts[:routing_key] || opts[:key]
+      @channel.basic_publish(payload, self.name, rk, opts)
 
       self
     end
@@ -155,7 +177,7 @@ module Bunny
     # @see http://rubybunny.info/articles/exchanges.html Exchanges and Publishing guide
     # @api public
     def delete(opts = {})
-      @channel.deregister_exchange(self)
+      @channel.delete_recorded_exchange(self)
       @channel.exchange_delete(@name, opts) unless predeclared?
     end
 
@@ -219,16 +241,6 @@ module Bunny
     def wait_for_confirms
       @channel.wait_for_confirms
     end
-
-    # @private
-    def recover_from_network_failure
-      declare! unless @options[:no_declare] ||predefined?
-
-      @bindings.each do |b|
-        bind(b[:source], b[:opts])
-      end
-    end
-
 
     #
     # Implementation
